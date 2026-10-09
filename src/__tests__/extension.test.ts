@@ -4,7 +4,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
+import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { convertToLlm, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { LIVE_CONTEXT_ANNOTATION, sourceContentHash } from "../continuity.ts";
 import liveContextExtension from "../index.ts";
@@ -148,6 +151,29 @@ function rawConversation(): LiveContextMessage[] {
 			timestamp: 2,
 		},
 	];
+}
+
+const continuityModel: Model<"openai-codex-responses"> = {
+	provider: "openai-codex",
+	api: "openai-codex-responses",
+	id: "continuity-fixture",
+	name: "Offline continuity fixture",
+	baseUrl: "https://example.invalid",
+	input: ["text"],
+	reasoning: false,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 100_000,
+	maxTokens: 4096,
+};
+
+/** Real Responses input serialization: request-local custom timestamps are not wire fields. */
+function responsesInput(messages: LiveContextMessage[]): string[] {
+	return convertResponsesMessages(
+		continuityModel,
+		{ messages: convertToLlm(messages as AgentMessage[]) } as Parameters<typeof convertResponsesMessages>[1],
+		new Set(["openai-codex"]),
+		{ includeSystemPrompt: false },
+	).map((item) => JSON.stringify(item));
 }
 
 function compactSecondTurn(document: string): string {
@@ -866,6 +892,168 @@ describe("live-context extension lifecycle", () => {
 		const afterResolve = await emit(harness, "context", { type: "context", messages: raw });
 		assert.doesNotMatch(JSON.stringify(afterResolve[0].messages), new RegExp(exactRequest.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 		await emit(harness, "session_shutdown", { type: "session_shutdown", reason: "quit" });
+	});
+});
+
+describe("pi-clm continuity placement", () => {
+	for (const editingMode of ["clm", "conservative"] as const) {
+		for (const noStore of [false, true]) {
+			test(`${editingMode}: continuity ordering ${noStore ? "without" : "with"} a mirror preserves conversation and tool pairs`, async (t) => {
+				if (noStore) t.mock.method(MirrorStore, "create", async () => { throw new Error("mirror unavailable"); });
+				const source: LiveContextMessage = { role: "user", content: "Keep the parser follow-up", timestamp: 1 };
+				const harness = createHarness([{ type: "message", id: "m1", parentId: null, message: source }]);
+				liveContextExtension(harness.pi, { editingMode });
+				await emit(harness, "session_start", { reason: "startup" });
+				try {
+					await harness.tools.get("live_context_annotate").execute("annotate", {
+						action: "create", source: "m1", title: "Parser follow-up", reason: "Still open",
+						futureAction: "Verify the parser", retention: "continuity",
+					}, undefined, undefined, harness.ctx);
+					const first = (await emit(harness, "context", { messages: [source] }))[0].messages as LiveContextMessage[];
+					assert.equal(first.length, 2, "no transient notices in the continuation fixture");
+					const continuityIndex = editingMode === "clm" ? 0 : 1;
+					assert.equal(first[continuityIndex].role, "custom");
+					assert.equal(first[continuityIndex].customType, "live-context-continuity");
+					assert.equal(first[continuityIndex].display, false);
+					assert.equal(JSON.parse(responsesInput(first)[continuityIndex]).role, "user");
+					assert.equal(first[editingMode === "clm" ? 1 : 0], source);
+
+					const call: LiveContextMessage = {
+						role: "assistant", api: continuityModel.api, provider: continuityModel.provider, model: continuityModel.id,
+						content: [{ type: "toolCall", id: "call_parser|fc_parser", name: "read", arguments: { path: "parser.ts" } }],
+						stopReason: "toolUse", timestamp: 2,
+					};
+					const result: LiveContextMessage = {
+						role: "toolResult", toolCallId: "call_parser|fc_parser", toolName: "read",
+						content: [{ type: "text", text: "Parser source" }], isError: false, timestamp: 3,
+					};
+					const second = (await emit(harness, "context", { messages: [source, call, result] }))[0].messages as LiveContextMessage[];
+					assert.equal(second.length, 4);
+					assert.deepEqual(second.filter((m) => m.customType !== "live-context-continuity"), [source, call, result]);
+					assert.equal(second[editingMode === "clm" ? 1 : 0], source);
+					assert.equal(second.indexOf(result), second.indexOf(call) + 1);
+					assert.equal(second[second.indexOf(call)], call);
+					assert.equal(second[second.indexOf(result)], result);
+					// Pi's WS baseline is previous input + previous assistant output, not just input.
+					const callOutput = responsesInput([call]).filter((item) => JSON.parse(item).type !== "function_call_output");
+					const baseline = [...responsesInput(first), ...callOutput];
+					assert.equal(JSON.stringify(responsesInput(second).slice(0, baseline.length)) === JSON.stringify(baseline), editingMode === "clm");
+					const answer: LiveContextMessage = {
+						...call, content: [{ type: "text", text: "Parser verified", textSignature: "msg_parser_verified" }],
+						stopReason: "stop", timestamp: 4,
+					};
+					const third = (await emit(harness, "context", { messages: [source, call, result, answer, { role: "user", content: "Continue", timestamp: 5 }] }))[0].messages;
+					const nextBaseline = [...responsesInput(second), ...responsesInput([answer])];
+					assert.equal(JSON.stringify(responsesInput(third).slice(0, nextBaseline.length)) === JSON.stringify(nextBaseline), editingMode === "clm");
+					if (!noStore) {
+						const prompt = (await emit(harness, "before_agent_start", { systemPrompt: "base" }))[0].systemPrompt;
+						const mirror = await readFile(prompt.match(/mirrored at `([^`]+)`/)[1], "utf8");
+						assert.doesNotMatch(mirror, /LIVE CONTEXT CONTINUITY|live-context-continuity/);
+					}
+				} finally { await emit(harness, "session_shutdown", {}); }
+			});
+		}
+	}
+
+	test("CLM: annotation replacement, resolution and branch restore update the leading snapshot", async () => {
+		const source: LiveContextMessage = { role: "user", content: "Source task", timestamp: 1 };
+		const harness = createHarness([{ type: "message", id: "m1", parentId: null, message: source }]);
+		harness.ctx.sessionManager.getLeafId = () => harness.branch.at(-1)?.id ?? null;
+		harness.ctx.mode = "rpc";
+		liveContextExtension(harness.pi, { editingMode: "clm" });
+		await emit(harness, "session_start", { reason: "startup" });
+		try {
+			const annotate = harness.tools.get("live_context_annotate");
+			const created = await annotate.execute("create", {
+				action: "create", source: "m1", title: "Original obligation", reason: "Open task",
+				futureAction: "Finish it", retention: "continuity",
+			}, undefined, undefined, harness.ctx);
+			const originalBranch = [...harness.branch];
+			const initial = (await emit(harness, "context", { messages: [source] }))[0].messages;
+			assert.match(initial[0].content, /Original obligation/);
+			// Annotation updates are append-only snapshots with the same ID, not a new tool action.
+			harness.pi.appendEntry(LIVE_CONTEXT_ANNOTATION, { ...created.details.annotation, title: "Updated obligation", futureAction: "Verify it" });
+			await emit(harness, "session_tree", {});
+			await harness.commands.get("clm").handler("input", harness.ctx);
+			assert.match(harness.notifications.at(-1)!, /current input \(2 messages\):\n#1 custom/);
+			const updated = (await emit(harness, "context", { messages: [source] }))[0].messages;
+			assert.match(updated[0].content, /Updated obligation/);
+			assert.doesNotMatch(updated[0].content, /Original obligation/);
+			const stable = (await emit(harness, "context", { messages: [source] }))[0].messages;
+			assert.deepEqual(responsesInput(stable), responsesInput(updated.filter((m: LiveContextMessage) => m.customType !== "live-context-notice")));
+			await annotate.execute("resolve", { action: "resolve", id: created.details.annotation.id, resolution: "Done" }, undefined, undefined, harness.ctx);
+			const resolved = (await emit(harness, "context", { messages: [source] }))[0].messages;
+			assert.deepEqual(resolved, [source]);
+
+			const resumed = createHarness([...harness.branch]);
+			liveContextExtension(resumed.pi, { editingMode: "clm" });
+			await emit(resumed, "session_start", { reason: "resume" });
+			try { assert.deepEqual((await emit(resumed, "context", { messages: [source] }))[0].messages, [source]); }
+			finally { await emit(resumed, "session_shutdown", {}); }
+
+			harness.branch.splice(0, harness.branch.length, ...originalBranch);
+			await emit(harness, "session_tree", {});
+			const restored = (await emit(harness, "context", { messages: [source] }))[0].messages;
+			assert.equal(restored[0].customType, "live-context-continuity");
+			assert.match(restored[0].content, /Original obligation/);
+			assert.doesNotMatch(restored[0].content, /Updated obligation/);
+			harness.branch.splice(1);
+			await emit(harness, "session_tree", {});
+			const early = (await emit(harness, "context", { messages: [source] }))[0].messages;
+			assert.equal(early.some((m: LiveContextMessage) => m.customType === "live-context-continuity"), false);
+		} finally { await emit(harness, "session_shutdown", {}); }
+	});
+
+	test("CLM: a mirror edit cannot erase a pin; checkpoint excludes continuity and subsequent input is stable", async () => {
+		const raw = rawConversation();
+		const harness = createHarness(raw.map((message, index) => ({ type: "message", id: `m${index + 1}`, parentId: index ? "m1" : null, message })));
+		harness.ctx.mode = "rpc";
+		liveContextExtension(harness.pi, { editingMode: "clm" });
+		await emit(harness, "session_start", { reason: "startup" });
+		try {
+			const prompt = (await emit(harness, "before_agent_start", { systemPrompt: "base" }))[0].systemPrompt;
+			const path = prompt.match(/mirrored at `([^`]+)`/)[1];
+			await harness.tools.get("live_context_annotate").execute("pin", {
+				action: "create", source: "m1", title: "Keep the objective", reason: "Exact wording matters",
+				futureAction: "Complete the objective", retention: "pin",
+			}, undefined, undefined, harness.ctx);
+			const before = (await emit(harness, "context", { messages: raw }))[0].messages;
+			assert.match(before[0].content, /already present in the projected conversation/);
+			const mirror = await readFile(path, "utf8");
+			assert.doesNotMatch(mirror, /LIVE CONTEXT CONTINUITY|live-context-continuity/);
+			await writeFile(path, mirror.replace("Solve the task", "Revised objective"));
+			await emit(harness, "turn_end", {});
+			const state = harness.branch.filter((entry) => entry.customType === LIVE_CONTEXT_STATE).at(-1).data;
+			assert.equal(state.lastOutcome.kind, "applied");
+			assert.equal(state.checkpoint.sourceMessageCount, raw.length);
+			assert.doesNotMatch(JSON.stringify(state.checkpoint), /LIVE CONTEXT CONTINUITY|live-context-continuity/);
+			await harness.commands.get("clm").handler("input", harness.ctx);
+			assert.match(harness.notifications.at(-1)!, /current input \(3 messages\):\n#1 custom/);
+			// Consume the unchanged, out-of-scope accepted-edit notice before checking continuation.
+			await emit(harness, "context", { messages: raw });
+			const edited = (await emit(harness, "context", { messages: raw }))[0].messages;
+			assert.equal(edited.length, 3);
+			assert.match(edited[0].content, /<live-context-pinned-source>[\s\S]*Solve the task/);
+			assert.equal(edited[1].content, "Revised objective");
+			assert.notEqual(edited[0].content, before[0].content, "pin source-presence change invalidates once");
+			const answer: LiveContextMessage = {
+				role: "assistant", api: continuityModel.api, provider: continuityModel.provider, model: continuityModel.id,
+				content: [{ type: "text", text: "Ready", textSignature: "msg_ready" }], stopReason: "stop", timestamp: 3,
+			};
+			const next = (await emit(harness, "context", { messages: [...raw, answer, { role: "user", content: "Continue", timestamp: 4 }] }))[0].messages;
+			const baseline = [...responsesInput(edited), ...responsesInput([answer])];
+			assert.deepEqual(responsesInput(next).slice(0, baseline.length), baseline);
+			const resumed = createHarness([...harness.branch]);
+			resumed.ctx.sessionManager.getLeafId = () => resumed.branch.at(-1)?.id ?? null;
+			resumed.ctx.mode = "rpc";
+			liveContextExtension(resumed.pi, { editingMode: "clm" });
+			await emit(resumed, "session_start", { reason: "resume" });
+			try {
+				await resumed.commands.get("clm").handler("input", resumed.ctx);
+				assert.match(resumed.notifications.at(-1)!, /current input \(3 messages\):\n#1 custom/);
+				assert.deepEqual(responsesInput((await emit(resumed, "context", { messages: raw }))[0].messages), responsesInput(edited));
+			} finally { await emit(resumed, "session_shutdown", {}); }
+		} finally { await emit(harness, "session_shutdown", {}); }
 	});
 });
 

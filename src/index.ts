@@ -817,6 +817,18 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		};
 	}
 
+	function withManagedContinuity(
+		effectiveMessages: LiveContextMessage[],
+		managedContinuity: LiveContextMessage | undefined,
+	): LiveContextMessage[] {
+		if (!managedContinuity) return effectiveMessages;
+		// Leading continuity preserves the serialized request prefix as conversation
+		// turns are appended, provided the annotation snapshot remains unchanged.
+		return editingMode === "clm"
+			? [managedContinuity, ...effectiveMessages]
+			: [...effectiveMessages, managedContinuity];
+	}
+
 	pi.on("resources_discover", () => ({
 		skillPaths: editingMode === "clm" ? [] : [join(EXTENSION_DIR, "skills")],
 	}));
@@ -1068,7 +1080,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 			: [];
 		const rawTokens = estimateLiveContextTokens(visibleRaw);
 		const managedContinuity = continuityMessage(ctx, effective);
-		const modelEffective = managedContinuity ? [...effective, managedContinuity] : effective;
+		const modelEffective = withManagedContinuity(effective, managedContinuity);
 		return {
 			rawMessageCount: sessionRawMessages.length,
 			rawMessages: [...sessionRawMessages],
@@ -1273,7 +1285,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		if (!store) {
 			turnBaseline = undefined;
 			const managedContinuity = continuityMessage(ctx, rawMessages);
-			const output = managedContinuity ? [...rawMessages, managedContinuity] : [...rawMessages];
+			const output = [...withManagedContinuity(rawMessages, managedContinuity)];
 			const sizeNotice = continuitySizeNotice(managedContinuity);
 			if (sizeNotice) {
 				output.push({
@@ -1367,9 +1379,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 			? rawTokens
 			: estimateLiveContextTokens(effectiveMessages);
 		const managedContinuity = continuityMessage(ctx, effectiveMessages);
-		const modelEffectiveMessages = managedContinuity
-			? [...effectiveMessages, managedContinuity]
-			: effectiveMessages;
+		const modelEffectiveMessages = withManagedContinuity(effectiveMessages, managedContinuity);
 		currentContextView = {
 			rawMessageCount: rawMessages.length,
 			rawMessages: [...rawMessages],
@@ -1383,7 +1393,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 		};
 		updateStatus(ctx);
 
-		// Extension-managed continuity is appended after the editable projection so
+		// Extension-managed continuity stays outside the editable projection so
 		// mirror compression cannot silently remove an active obligation or exact pin.
 		const snapshot = renderContextDocument(effectiveMessages, {
 			revision: state.revision,
@@ -1656,9 +1666,7 @@ export default function liveContextExtension(pi: ExtensionAPI, options: LiveCont
 			return;
 		}
 		const managedContinuity = continuityMessage(ctx, result.messages);
-		const modelEffectiveMessages = managedContinuity
-			? [...result.messages, managedContinuity]
-			: result.messages;
+		const modelEffectiveMessages = withManagedContinuity(result.messages, managedContinuity);
 		currentContextView = {
 			rawMessageCount: baseline.rawMessages.length,
 			rawMessages: [...baseline.rawMessages],

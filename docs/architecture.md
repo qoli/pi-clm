@@ -159,10 +159,12 @@ Two numbers are measured and always labelled separately:
 
 - **estimated next request** — system prompt + effective messages, using Pi's
   provider-independent estimator;
-- **observed previous request** — `totalTokens` of the newest successful assistant message
-  (the provider's own count). It is one call late and is marked stale after an accepted
-  edit, when it no longer describes the current context. After `/clm reset` or a native
-  compaction, status shows an estimate of the rebuilt context until the next request.
+- **observed previous request** — `input + cacheRead + cacheWrite` of the newest
+  successful assistant message, excluding generated output. Records with only
+  `totalTokens` fall back to that total minus reported output. It is one call late and
+  is marked stale after an accepted edit, when it no longer describes the current
+  context. After `/clm reset` or a native compaction, status shows an estimate of the
+  rebuilt context until the next request.
 
 A reminder is judged on the larger fresh number. In practice the estimator undercounts
 by tens of percent relative to providers, which is why the observed count may govern.
@@ -278,10 +280,11 @@ context. `/clm <page>` opens a page directly, and outside the TUI the command pr
 page as text. `/clm status` prints three lines (next request against the budget, edits,
 changed settings). Four pages:
 
-- **overview** — a bar chart of the provider-reported size of every request on the
-  branch (one column per request), the budget as a dashed line, requests followed by an
-  accepted edit marked, and the list of compaction points with per-message counts. It
-  opens on **now** (the latest request, pinned to the right edge); `← →` step through
+- **overview** — a bar chart of the provider-reported prompt size (excluding output)
+  of every request on the branch (one column per request), the budget as a dashed
+  line, requests followed by an accepted edit marked, and the list of compaction
+  points with per-message counts. It opens on **now** (the latest request, pinned to
+  the right edge); `← →` step through
   compaction points and back to now. When the branch is wider than the terminal the
   window pans to keep the selected point centred, clamped so it never shows empty columns.
   `z` cycles the x axis (`TimelineZoom` in `src/timeline.ts`; shown to users as all /
@@ -322,7 +325,8 @@ changed settings). Four pages:
   prompt, stays on screen.
 
 The timeline is built from session entries alone (assistant usage and state entries), so it
-is available on resume without extra persistence.
+is available on resume without extra persistence. Selected column descriptions show
+reported generated tokens separately from the prompt size.
 
 ## 9. Storage and safety
 
@@ -349,6 +353,7 @@ src/mirror-store.ts          private atomic mirror file lifecycle
 src/mirror-guard.ts          classify tool calls that read or write the mirror
 src/policy.ts                conservative-mode protection and pressure tiers
 src/budget.ts                CLM budget, tiers, notice text
+src/usage.ts                 prompt-only provider usage shared by calibration and timeline
 src/observation.ts           per-tool-result cap in the effective context
 src/overflow.ts              overflow guard: withhold the oldest tool results above the limit
 src/steering.ts              steering document loading and prompt section

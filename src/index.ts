@@ -5,7 +5,6 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	buildSessionContext,
-	calculateContextTokens,
 	estimateTokens,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
@@ -38,6 +37,7 @@ import {
 	type LiveContextRetention,
 } from "./continuity.ts";
 import { MirrorStore } from "./mirror-store.ts";
+import { promptTokens } from "./usage.ts";
 import {
 	BudgetTracker,
 	EstimateCalibrator,
@@ -168,7 +168,7 @@ function lastProviderReportedTokens(rawMessages: LiveContextMessage[]): { tokens
 		if (message.stopReason === "aborted" || message.stopReason === "error") continue;
 		const usage = message.usage;
 		if (!usage) continue;
-		const tokens = calculateContextTokens(usage);
+		const tokens = promptTokens(usage);
 		if (tokens > 0) return { tokens, index };
 	}
 	return undefined;

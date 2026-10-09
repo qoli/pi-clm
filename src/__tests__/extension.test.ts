@@ -977,7 +977,7 @@ describe("pi-clm entry point", () => {
 			const notice = crossed[0].messages.find((m: any) => typeof m.content === "string" && m.content.startsWith("[CLM BUDGET]"));
 			assert.ok(notice, "expected a budget notice");
 			assert.match(notice.content, /crossed 50% of a 1,000-token budget/);
-			assert.match(notice.content, /the provider reported 710 for the previous one/);
+			assert.match(notice.content, /the provider reported 700 for the previous one/);
 			assert.match(notice.content, /estimated \d+ tokens for the next request/);
 			// Same tier does not fire twice.
 			const again = await emit(harness, "context", { messages: raw });
@@ -993,9 +993,9 @@ describe("pi-clm entry point", () => {
 			const details = await clmSettingsText(harness);
 			assert.match(details, /Budget +1k\n/);
 			assert.match(details, /Reserve +100\n/);
-			// The 710-token observation predates the accepted edit: it is not shown as current.
+			// The 700-token prompt observation predates the accepted edit: it is not shown as current.
 			assert.match(details, /Size +next request ~\d+ of 1k\n/);
-			assert.doesNotMatch(details, /last request 710/);
+			assert.doesNotMatch(details, /last request 700/);
 
 			await harness.commands.get("clm").handler("budget 500", harness.ctx);
 			assert.match(harness.notifications.at(-1)!, /CLM Budget: 500\./);
@@ -1178,6 +1178,26 @@ describe("pi-clm entry point", () => {
 			assert.match(await clmSettingsText(harness), /Guard +withholds the oldest tool results above 2\.5k/);
 		} finally { await emit(harness, "session_shutdown", {}); }
 	});
+	test("CLM: generated output does not inflate prompt calibration or cross a budget tier", async () => {
+		const harness = createHarness();
+		liveContextExtension(harness.pi, { editingMode: "clm", budget: { contextBudget: 1000, reserve: 100, remindAtFractions: [0.5] } });
+		harness.ctx.model = { contextWindow: 100_000 };
+		harness.ctx.getSystemPrompt = () => "";
+		await emit(harness, "session_start", { reason: "startup" });
+		try {
+			const raw: LiveContextMessage[] = [{ role: "user", content: "task ".repeat(240), timestamp: 1 }];
+			await emit(harness, "context", { messages: raw });
+			const answer = {
+				role: "assistant", content: [{ type: "text", text: "ok" }], api: "t", provider: "t", model: "t",
+				usage: { input: 100, cacheRead: 150, cacheWrite: 50, output: 2000, totalTokens: 2300, cost: { total: 0 } },
+				stopReason: "stop", timestamp: 2,
+			} as LiveContextMessage;
+			const sent = (await emit(harness, "context", { messages: [...raw, answer] }))[0].messages;
+			assert.equal(sent.some((m: any) => JSON.stringify(m.content).includes("[CLM BUDGET]")), false);
+			assert.match(await clmSettingsText(harness), /estimate ×1\.00, calibrated from 1 provider count/);
+		} finally { await emit(harness, "session_shutdown", {}); }
+	});
+
 	test("CLM: provider counts calibrate the estimator and the guard withholds more; threshold compaction is cancelled while the context fits", async () => {
 		const harness = createHarness();
 		liveContextExtension(harness.pi, { editingMode: "clm", budget: { contextBudget: 6000, reserve: 1000, remindAtFractions: [], remindAtReserve: false } });

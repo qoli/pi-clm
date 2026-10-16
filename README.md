@@ -44,6 +44,10 @@ zooms the chart, `Enter` opens the selection, `q` closes.
 - [Architecture](docs/architecture.md) — the system as implemented, design notes, known limitations.
 - [Development](docs/development.md) — setup, checks, releasing.
 
+## Community
+
+- [LINUX DO](https://linux.do/)
+
 ## Citation
 
 If you use pi-clm in your research, please cite
